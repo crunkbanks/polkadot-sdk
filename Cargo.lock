@@ -5136,6 +5136,7 @@ dependencies = [
  "sp-runtime 31.0.1",
  "sp-statement-store",
  "tokio",
+ "verifiable",
  "zombienet-configuration",
  "zombienet-orchestrator",
  "zombienet-sdk",

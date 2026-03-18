@@ -210,7 +210,7 @@ fn create_set_storage_call(items: Vec<(Vec<u8>, Vec<u8>)>) -> DynamicPayload {
 }
 
 /// Submits an extrinsic with an explicit nonce and waits for it to be included in a block
-async fn submit_sudo_extrinsic<S: Signer<CustomConfig>>(
+pub(super) async fn submit_sudo_extrinsic<S: Signer<CustomConfig>>(
 	client: &OnlineClient<CustomConfig>,
 	call: &DynamicPayload,
 	signer: &S,
@@ -322,10 +322,16 @@ async fn set_allowances_via_sudo(
 	Ok(())
 }
 
-/// Spawns a network with the sudo-enabled chain spec and sets allowances at runtime
-pub(super) async fn spawn_network_sudo(
+/// Spawns a network with the sudo-enabled chain spec without setting any allowances
+pub(super) async fn spawn_network(
 	collators: &[&str],
-	allowance_items: Vec<(Vec<u8>, Vec<u8>)>,
+) -> Result<Network<LocalFileSystem>, anyhow::Error> {
+	spawn_network_inner(collators, 0).await
+}
+
+async fn spawn_network_inner(
+	collators: &[&str],
+	participant_count: usize,
 ) -> Result<Network<LocalFileSystem>, anyhow::Error> {
 	let images = zombienet_sdk::environment::get_images_from_env();
 
@@ -335,8 +341,6 @@ pub(super) async fn spawn_network_sudo(
 		.unwrap_or_else(|| std::env::temp_dir().join(format!("zombienet-{}", std::process::id())));
 	std::fs::create_dir_all(&base_dir)
 		.map_err(|e| anyhow!("Failed to create base directory: {}", e))?;
-
-	let participant_count = allowance_items.len();
 
 	let config = NetworkConfigBuilder::new()
 		.with_relaychain(|r| {
@@ -348,26 +352,36 @@ pub(super) async fn spawn_network_sudo(
 				.with_validator(|node| node.with_name("validator-1"))
 		})
 		.with_parachain(|p| {
+			let mut args = vec![
+				"--force-authoring".into(),
+				"--authoring".into(),
+				"slot-based".into(),
+				"--max-runtime-instances=32".into(),
+				"-linfo,statement-store=info,statement-gossip=info".into(),
+				"--enable-statement-store".into(),
+			];
+			if participant_count > 0 {
+				args.push(
+					format!("--rpc-max-connections={}", participant_count + 1000)
+						.as_str()
+						.into(),
+				);
+				args.push(
+					format!(
+						"--rpc-max-subscriptions-per-connection={}",
+						(participant_count * 16).max(32)
+					)
+					.as_str()
+					.into(),
+				);
+			}
+
 			let p = p
 				.with_id(2101)
 				.with_chain_spec_path("https://raw.githubusercontent.com/paritytech/chainspecs/denzelpenzel/versi-people-2101/versi/parachain/versi-people-2101/chainspec.json")
 				.with_default_command("polkadot-parachain")
 				.with_default_image(images.cumulus.as_str())
-				.with_default_args(vec![
-					"--force-authoring".into(),
-					"--authoring".into(),
-					"slot-based".into(),
-					"--max-runtime-instances=32".into(),
-					"-linfo,statement-store=info,statement-gossip=info".into(),
-					"--enable-statement-store".into(),
-					format!("--rpc-max-connections={}", participant_count + 1000).as_str().into(),
-					format!(
-						"--rpc-max-subscriptions-per-connection={}",
-						(participant_count * 16).max(32)
-					)
-						.as_str()
-						.into(),
-				])
+				.with_default_args(args)
 				.with_collator(|n| n.with_name(collators[0]));
 
 			collators[1..]
@@ -394,8 +408,62 @@ pub(super) async fn spawn_network_sudo(
 		.await?;
 	info!("Parachain is producing blocks");
 
+	Ok(network)
+}
+
+/// Spawns a network with the sudo-enabled chain spec and sets allowances at runtime
+pub(super) async fn spawn_network_sudo(
+	collators: &[&str],
+	allowance_items: Vec<(Vec<u8>, Vec<u8>)>,
+) -> Result<Network<LocalFileSystem>, anyhow::Error> {
+	let network = spawn_network_inner(collators, allowance_items.len()).await?;
+	let node = network.get_node(collators[0])?;
 	let para_client = node.wait_client::<CustomConfig>().await?;
 	set_allowances_via_sudo(&para_client, allowance_items).await?;
-
 	Ok(network)
+}
+
+/// Submits a signed (non-sudo) extrinsic and waits for inclusion in a block
+pub(super) async fn submit_signed_extrinsic<S: Signer<CustomConfig>>(
+	client: &OnlineClient<CustomConfig>,
+	call: &DynamicPayload,
+	signer: &S,
+	nonce: u64,
+) -> Result<H256, anyhow::Error> {
+	let dp = DefaultExtrinsicParamsBuilder::<CustomConfig>::new()
+		.immortal()
+		.nonce(nonce)
+		.build();
+	let extensions =
+		(dp.0, dp.1, dp.2, dp.3, dp.4, dp.5, dp.6, dp.7, dp.8, (), (), (), (), (), (), ());
+
+	let mut tx = client
+		.tx()
+		.create_signed(call, signer, extensions)
+		.await?
+		.submit_and_watch()
+		.await?;
+
+	while let Some(status) = tx.next().await.transpose()? {
+		match status {
+			TxStatus::InBestBlock(tx_in_block) => {
+				let block_hash = tx_in_block.block_hash();
+				tx_in_block.wait_for_success().await?;
+				return Ok(block_hash);
+			},
+			TxStatus::InFinalizedBlock(ref tx_in_block) => {
+				let block_hash = tx_in_block.block_hash();
+				tx_in_block.wait_for_success().await?;
+				return Ok(block_hash);
+			},
+			TxStatus::Error { message } |
+			TxStatus::Invalid { message } |
+			TxStatus::Dropped { message } => {
+				return Err(anyhow!("Error submitting signed tx: {message}"));
+			},
+			_ => continue,
+		}
+	}
+
+	Err(anyhow!("Transaction event stream ended without being included in a block"))
 }

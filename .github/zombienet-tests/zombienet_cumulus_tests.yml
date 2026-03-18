@@ -153,3 +153,9 @@
   runner-type: "default"
   cumulus-image: "test-parachain"
   use-zombienet-sdk: true
+
+- job-name: "zombienet-cumulus-0027-statement_store_lite_person_submit"
+  test-filter: "zombie_ci::statement_store::statement_store_integration::statement_store_lite_person_submit_and_propagate"
+  runner-type: "default"
+  cumulus-image: "test-parachain"
+  use-zombienet-sdk: true
