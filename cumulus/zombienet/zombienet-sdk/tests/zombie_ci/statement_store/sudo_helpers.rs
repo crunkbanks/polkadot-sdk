@@ -3,164 +3,188 @@
 
 //! Sudo extrinsic helpers and custom subxt config for statement store tests
 //!
-//! Contains the `CustomConfig` type (with `CustomExtrinsicParams`) needed to
-//! submit extrinsics on people-westend, plus helpers that set statement
-//! allowances at runtime via `Sudo::sudo(System::set_storage(...))`
+//! Contains the `CustomConfig` type needed to submit extrinsics on
+//! people-westend, plus helpers that set statement allowances at runtime
+//! via `Sudo::sudo(System::set_storage(...))`
 
-use std::{any::Any, path::PathBuf, time::Duration};
+use std::path::PathBuf;
 
 use anyhow::anyhow;
 use codec::Encode;
-use futures::StreamExt;
 use log::info;
+use scale_info::PortableRegistry;
 use sp_core::Pair;
 use sp_statement_store::{statement_allowance_key, StatementAllowance};
-use zombienet_sdk::{
-	subxt::{
-		config::{
-			transaction_extensions::{
-				AnyOf, ChargeAssetTxPayment, ChargeTransactionPayment, CheckGenesis,
-				CheckMetadataHash, CheckMortality, CheckNonce, CheckSpecVersion, CheckTxVersion,
-				TransactionExtension, VerifySignatureDetails,
-			},
-			Config, DefaultExtrinsicParamsBuilder, ExtrinsicParams, ExtrinsicParamsEncoder,
+use subxt::{
+	config::{
+		substrate::SubstrateConfig,
+		transaction_extensions::{
+			ChargeAssetTxPayment, ChargeTransactionPayment, CheckGenesis, CheckMetadataHash,
+			CheckMortality, CheckNonce, CheckSpecVersion, CheckTxVersion, VerifySignature,
 		},
-		dynamic::Value,
-		ext::scale_value::value,
-		tx::{signer::Signer, DynamicPayload, TxStatus},
-		utils::{Static, H256},
-		OnlineClient, PolkadotConfig,
+		ClientState, Config, DefaultExtrinsicParamsBuilder, TransactionExtension,
 	},
-	LocalFileSystem, Network, NetworkConfigBuilder,
+	dynamic::Value,
+	ext::{frame_decode, scale_value::value},
+	transactions::Signer,
+	utils::H256,
+	OnlineClient,
 };
+use zombienet_sdk::{LocalFileSystem, Network, NetworkConfigBuilder};
 
 use super::common::get_keypair;
 
-pub(super) struct VerifyMultiSignature<T: Config>(VerifySignatureDetails<T>);
+pub struct VerifyMultiSignature<T: Config>(VerifySignature<T>);
 
-impl<T: Config> ExtrinsicParams<T> for VerifyMultiSignature<T> {
-	type Params = ();
+impl<T: Config> frame_decode::extrinsics::TransactionExtension<PortableRegistry>
+	for VerifyMultiSignature<T>
+{
+	const NAME: &str = "VerifyMultiSignature";
 
-	fn new(
-		_client: &zombienet_sdk::subxt::client::ClientState<T>,
-		_params: Self::Params,
-	) -> Result<Self, zombienet_sdk::subxt::config::ExtrinsicParamsError> {
-		Ok(VerifyMultiSignature(VerifySignatureDetails::Disabled))
-	}
-}
-
-impl<T: Config> ExtrinsicParamsEncoder for VerifyMultiSignature<T> {
-	fn encode_value_to(&self, v: &mut Vec<u8>) {
-		self.0.encode_to(v);
+	fn encode_value_to(
+		&self,
+		type_id: u32,
+		type_resolver: &PortableRegistry,
+		v: &mut Vec<u8>,
+	) -> Result<(), frame_decode::extrinsics::TransactionExtensionError> {
+		self.0.encode_value_to(type_id, type_resolver, v)
 	}
 
-	fn inject_signature(&mut self, account: &dyn Any, signature: &dyn Any) {
-		let account = account
-			.downcast_ref::<T::AccountId>()
-			.expect("A T::AccountId should have been provided")
-			.clone();
-		let signature = signature
-			.downcast_ref::<T::Signature>()
-			.expect("A T::Signature should have been provided")
-			.clone();
-		self.0 = VerifySignatureDetails::Signed { signature, account };
+	fn encode_value_for_signer_payload_to(
+		&self,
+		type_id: u32,
+		type_resolver: &PortableRegistry,
+		v: &mut Vec<u8>,
+	) -> Result<(), frame_decode::extrinsics::TransactionExtensionError> {
+		self.0.encode_value_for_signer_payload_to(type_id, type_resolver, v)
+	}
+
+	fn encode_implicit_to(
+		&self,
+		type_id: u32,
+		type_resolver: &PortableRegistry,
+		v: &mut Vec<u8>,
+	) -> Result<(), frame_decode::extrinsics::TransactionExtensionError> {
+		self.0.encode_implicit_to(type_id, type_resolver, v)
 	}
 }
 
 impl<T: Config> TransactionExtension<T> for VerifyMultiSignature<T> {
-	type Decoded = Static<VerifySignatureDetails<T>>;
+	type Decoded = <VerifySignature<T> as TransactionExtension<T>>::Decoded;
+	type Params = ();
 
-	fn matches(identifier: &str, _type_id: u32, _types: &::scale_info::PortableRegistry) -> bool {
-		identifier == "VerifyMultiSignature" || identifier == "VerifySignature"
+	fn new(
+		client: &ClientState<T>,
+		params: Self::Params,
+	) -> Result<Self, subxt::error::TransactionExtensionError> {
+		Ok(VerifyMultiSignature(VerifySignature::new(client, params)?))
+	}
+
+	fn inject_signature(&mut self, account_id: &T::AccountId, signature: &T::Signature) {
+		self.0.inject_signature(account_id, signature);
 	}
 }
 
-/// Macro to define named skip handlers for custom non-empty transaction extensions
-///
-/// Each generated struct matches by its identifier name via `stringify!($name)` and encodes as
-/// `0x00` (first-variant enum / `None`). Invoke with actual extension names when targeting
-/// runtimes with custom non-empty extensions
-macro_rules! define_skip_unknown_extensions {
-	($($name:ident),+ $(,)?) => { $(
-		pub struct $name;
+pub struct RestrictOrigins;
 
-		impl<T: Config> ExtrinsicParams<T> for $name {
-			type Params = ();
+impl frame_decode::extrinsics::TransactionExtension<PortableRegistry> for RestrictOrigins {
+	const NAME: &str = "RestrictOrigins";
 
-			fn new(
-				_client: &zombienet_sdk::subxt::client::ClientState<T>,
-				_params: Self::Params,
-			) -> Result<Self, zombienet_sdk::subxt::config::ExtrinsicParamsError> {
-				Ok($name)
-			}
-		}
+	fn encode_value_to(
+		&self,
+		_type_id: u32,
+		_type_resolver: &PortableRegistry,
+		v: &mut Vec<u8>,
+	) -> Result<(), frame_decode::extrinsics::TransactionExtensionError> {
+		v.push(0x00);
+		Ok(())
+	}
 
-		impl ExtrinsicParamsEncoder for $name {
-			fn encode_value_to(&self, v: &mut Vec<u8>) {
-				v.push(0x00);
-			}
-		}
-
-		impl<T: Config> TransactionExtension<T> for $name {
-			type Decoded = Static<u8>;
-
-			fn matches(
-				identifier: &str,
-				_type_id: u32,
-				_types: &::scale_info::PortableRegistry,
-			) -> bool {
-				identifier == stringify!($name)
-			}
-		}
-	)+ };
+	fn encode_implicit_to(
+		&self,
+		_type_id: u32,
+		_type_resolver: &PortableRegistry,
+		_v: &mut Vec<u8>,
+	) -> Result<(), frame_decode::extrinsics::TransactionExtensionError> {
+		Ok(())
+	}
 }
 
-// Skip handlers for custom non-empty extensions in the people-westend runtime
-// Zero-sized extensions (e.g. ProvideForVoucherClaimer) are auto-skipped by AnyOf
-define_skip_unknown_extensions!(
-	AsPerson,
-	AsProofOfInkParticipant,
-	ScoreAsParticipant,
-	GameAsInvited,
-	PeopleLiteAuth,
-	AsCoinage,
-	RestrictOrigins, // encodes as a bool false (0x00) disables it
-);
+impl<T: Config> TransactionExtension<T> for RestrictOrigins {
+	type Decoded = u8;
+	type Params = ();
 
-pub(super) type CustomExtrinsicParams<T> = AnyOf<
-	T,
-	(
-		VerifyMultiSignature<T>,
+	fn new(
+		_client: &ClientState<T>,
+		_params: Self::Params,
+	) -> Result<Self, subxt::error::TransactionExtensionError> {
+		Ok(RestrictOrigins)
+	}
+}
+
+/// Custom config for the people-westend parachain with custom transaction extensions
+#[derive(Debug, Clone)]
+pub struct CustomConfig(SubstrateConfig);
+
+impl Default for CustomConfig {
+	fn default() -> Self {
+		CustomConfig(SubstrateConfig::new())
+	}
+}
+
+impl Config for CustomConfig {
+	type AccountId = <SubstrateConfig as Config>::AccountId;
+	type Address = subxt::utils::MultiAddress<Self::AccountId, ()>;
+	type Signature = <SubstrateConfig as Config>::Signature;
+	type Hasher = <SubstrateConfig as Config>::Hasher;
+	type Header = <SubstrateConfig as Config>::Header;
+	type AssetId = <SubstrateConfig as Config>::AssetId;
+	type TransactionExtensions = (
+		VerifyMultiSignature<Self>,
 		CheckSpecVersion,
 		CheckTxVersion,
 		CheckNonce,
-		CheckGenesis<T>,
-		CheckMortality<T>,
-		ChargeAssetTxPayment<T>,
+		CheckGenesis<Self>,
+		CheckMortality<Self>,
+		ChargeAssetTxPayment<Self>,
 		ChargeTransactionPayment,
 		CheckMetadataHash,
-		AsPerson,
-		AsProofOfInkParticipant,
-		ScoreAsParticipant,
-		GameAsInvited,
-		PeopleLiteAuth,
-		AsCoinage,
 		RestrictOrigins,
-	),
->;
+	);
 
-/// Custom subxt [`Config`] identical to [`PolkadotConfig`] but using [`CustomExtrinsicParams`]
-#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
-pub(super) enum CustomConfig {}
+	fn genesis_hash(&self) -> Option<subxt::config::HashFor<Self>> {
+		self.0.genesis_hash()
+	}
 
-impl Config for CustomConfig {
-	type AccountId = <PolkadotConfig as Config>::AccountId;
-	type Address = <PolkadotConfig as Config>::Address;
-	type Signature = <PolkadotConfig as Config>::Signature;
-	type Hasher = <PolkadotConfig as Config>::Hasher;
-	type Header = <PolkadotConfig as Config>::Header;
-	type ExtrinsicParams = CustomExtrinsicParams<Self>;
-	type AssetId = <PolkadotConfig as Config>::AssetId;
+	fn spec_and_transaction_version_for_block_number(
+		&self,
+		block_number: u64,
+	) -> Option<(u32, u32)> {
+		self.0.spec_and_transaction_version_for_block_number(block_number)
+	}
+
+	fn metadata_for_spec_version(
+		&self,
+		spec_version: u32,
+	) -> Option<subxt::metadata::ArcMetadata> {
+		self.0.metadata_for_spec_version(spec_version)
+	}
+
+	fn set_metadata_for_spec_version(
+		&self,
+		spec_version: u32,
+		metadata: subxt::metadata::ArcMetadata,
+	) {
+		self.0.set_metadata_for_spec_version(spec_version, metadata)
+	}
+}
+
+pub(super) async fn online_client_from_node(
+	node: &zombienet_sdk::NetworkNode,
+) -> Result<OnlineClient<CustomConfig>, anyhow::Error> {
+	let ws_uri = node.ws_uri();
+	let client = OnlineClient::<CustomConfig>::from_insecure_url(ws_uri).await?;
+	Ok(client)
 }
 
 /// Creates storage items for custom per-participant allowances
@@ -194,13 +218,15 @@ pub(super) fn create_uniform_allowance_items(
 }
 
 /// Creates a sudo -> frame_system::set_storage call to set statement allowances
-fn create_set_storage_call(items: Vec<(Vec<u8>, Vec<u8>)>) -> DynamicPayload {
+fn create_set_storage_call(
+	items: Vec<(Vec<u8>, Vec<u8>)>,
+) -> subxt::transactions::DynamicPayload<Vec<Value>> {
 	let items_value: Vec<Value> = items
 		.into_iter()
 		.map(|(key, value)| value!((Value::from_bytes(key), Value::from_bytes(value))))
 		.collect();
 
-	zombienet_sdk::subxt::tx::dynamic(
+	subxt::transactions::dynamic(
 		"Sudo",
 		"sudo",
 		vec![value! {
@@ -209,86 +235,35 @@ fn create_set_storage_call(items: Vec<(Vec<u8>, Vec<u8>)>) -> DynamicPayload {
 	)
 }
 
-/// Submits an extrinsic with an explicit nonce and waits for it to be included in a block
-pub(super) async fn submit_sudo_extrinsic<S: Signer<CustomConfig>>(
-	client: &OnlineClient<CustomConfig>,
-	call: &DynamicPayload,
-	signer: &S,
-	nonce: u64,
-) -> Result<
-	zombienet_sdk::subxt::tx::TxProgress<CustomConfig, OnlineClient<CustomConfig>>,
-	anyhow::Error,
-> {
-	let dp = DefaultExtrinsicParamsBuilder::<CustomConfig>::new()
+/// Builds params for our CustomConfig's 10 transaction extensions (9 defaults + RestrictOrigins)
+fn build_params(nonce: u64) -> <
+	<CustomConfig as Config>::TransactionExtensions
+	as subxt::config::TransactionExtensions<CustomConfig>
+>::Params {
+	let (a, b, c, d, e, f, g, h, i) = DefaultExtrinsicParamsBuilder::<CustomConfig>::new()
 		.immortal()
 		.nonce(nonce)
 		.build();
-	let extensions =
-		(dp.0, dp.1, dp.2, dp.3, dp.4, dp.5, dp.6, dp.7, dp.8, (), (), (), (), (), (), ());
-
-	let mut tx = client
-		.tx()
-		.create_signed(call, signer, extensions)
-		.await?
-		.submit_and_watch()
-		.await?;
-
-	while let Some(status) = tx.next().await.transpose()? {
-		match status {
-			TxStatus::InBestBlock(tx_in_block) => {
-				tx_in_block.wait_for_success().await?;
-				return Ok(tx);
-			},
-			TxStatus::InFinalizedBlock(ref tx_in_block) => {
-				tx_in_block.wait_for_success().await?;
-				return Ok(tx);
-			},
-			TxStatus::Error { message } |
-			TxStatus::Invalid { message } |
-			TxStatus::Dropped { message } => {
-				return Err(anyhow!("Error submitting sudo tx: {message}"));
-			},
-			_ => continue,
-		}
-	}
-
-	Err(anyhow!("Transaction event stream ended without being included in a block"))
+	(a, b, c, d, e, f, g, h, i, ())
 }
 
-/// Waits for a tx to finalize
-async fn wait_for_tx_finalization<Tx>(
-	tx_stream: &mut Tx,
-	timeout_secs: u64,
-) -> Result<H256, anyhow::Error>
-where
-	Tx: futures::Stream<
-			Item = Result<
-				TxStatus<CustomConfig, OnlineClient<CustomConfig>>,
-				zombienet_sdk::subxt::Error,
-			>,
-		> + Unpin,
-{
-	let watch_future = async {
-		while let Some(status) = tx_stream.next().await.transpose()? {
-			match status {
-				TxStatus::InFinalizedBlock(ref tx_in_block) => {
-					tx_in_block.wait_for_success().await?;
-					return Ok(tx_in_block.block_hash());
-				},
-				TxStatus::Error { message } |
-				TxStatus::Invalid { message } |
-				TxStatus::Dropped { message } => {
-					return Err(anyhow!("Tx error during finalization: {message}"));
-				},
-				_ => continue,
-			}
-		}
-		Err(anyhow!("Transaction stream ended without finalization"))
-	};
+/// Submits an extrinsic with an explicit nonce and waits for it to be finalized.
+pub(super) async fn submit_sudo_extrinsic<S: Signer<CustomConfig>>(
+	client: &OnlineClient<CustomConfig>,
+	call: &subxt::transactions::DynamicPayload<Vec<Value>>,
+	signer: &S,
+	nonce: u64,
+) -> Result<H256, anyhow::Error> {
+	let tx_in_block = client
+		.tx()
+		.await?
+		.sign_and_submit_then_watch(call, signer, build_params(nonce))
+		.await?
+		.wait_for_finalized()
+		.await?;
 
-	tokio::time::timeout(Duration::from_secs(timeout_secs), watch_future)
-		.await
-		.map_err(|_| anyhow!("Timeout waiting for tx finalization after {}s", timeout_secs))?
+	tx_in_block.wait_for_success().await?;
+	Ok(tx_in_block.block_hash())
 }
 
 /// Gets the current nonce for an account
@@ -296,7 +271,7 @@ async fn get_account_nonce(
 	client: &OnlineClient<CustomConfig>,
 	account_id: &<CustomConfig as Config>::AccountId,
 ) -> Result<u64, anyhow::Error> {
-	let nonce = client.tx().account_nonce(account_id).await?;
+	let nonce = client.tx().await?.account_nonce(account_id).await?;
 	Ok(nonce)
 }
 
@@ -307,16 +282,15 @@ async fn set_allowances_via_sudo(
 ) -> Result<(), anyhow::Error> {
 	info!("Setting {} statement allowances via sudo...", items.len());
 
-	let alice = zombienet_sdk::subxt_signer::sr25519::dev::alice();
+	let alice = subxt_signer::sr25519::dev::alice();
 	let alice_account_id =
-		<zombienet_sdk::subxt_signer::sr25519::Keypair as Signer<CustomConfig>>::account_id(&alice);
+		<subxt_signer::sr25519::Keypair as Signer<CustomConfig>>::account_id(&alice);
 
 	let current_nonce = get_account_nonce(para_client, &alice_account_id).await?;
 	let set_storage_call = create_set_storage_call(items);
 
-	let mut tx_stream =
+	let block_hash =
 		submit_sudo_extrinsic(para_client, &set_storage_call, &alice, current_nonce).await?;
-	let block_hash = wait_for_tx_finalization(&mut tx_stream, 120).await?;
 	info!("Statement allowances set and finalized in block {:?}", block_hash);
 
 	Ok(())
@@ -418,52 +392,26 @@ pub(super) async fn spawn_network_sudo(
 ) -> Result<Network<LocalFileSystem>, anyhow::Error> {
 	let network = spawn_network_inner(collators, allowance_items.len()).await?;
 	let node = network.get_node(collators[0])?;
-	let para_client = node.wait_client::<CustomConfig>().await?;
+	let para_client = online_client_from_node(node).await?;
 	set_allowances_via_sudo(&para_client, allowance_items).await?;
 	Ok(network)
 }
 
-/// Submits a signed (non-sudo) extrinsic and waits for inclusion in a block
+/// Submits a signed (non-sudo) extrinsic and waits for finalization
 pub(super) async fn submit_signed_extrinsic<S: Signer<CustomConfig>>(
 	client: &OnlineClient<CustomConfig>,
-	call: &DynamicPayload,
+	call: &subxt::transactions::DynamicPayload<Vec<Value>>,
 	signer: &S,
 	nonce: u64,
 ) -> Result<H256, anyhow::Error> {
-	let dp = DefaultExtrinsicParamsBuilder::<CustomConfig>::new()
-		.immortal()
-		.nonce(nonce)
-		.build();
-	let extensions =
-		(dp.0, dp.1, dp.2, dp.3, dp.4, dp.5, dp.6, dp.7, dp.8, (), (), (), (), (), (), ());
-
-	let mut tx = client
+	let tx_in_block = client
 		.tx()
-		.create_signed(call, signer, extensions)
 		.await?
-		.submit_and_watch()
+		.sign_and_submit_then_watch(call, signer, build_params(nonce))
+		.await?
+		.wait_for_finalized()
 		.await?;
 
-	while let Some(status) = tx.next().await.transpose()? {
-		match status {
-			TxStatus::InBestBlock(tx_in_block) => {
-				let block_hash = tx_in_block.block_hash();
-				tx_in_block.wait_for_success().await?;
-				return Ok(block_hash);
-			},
-			TxStatus::InFinalizedBlock(ref tx_in_block) => {
-				let block_hash = tx_in_block.block_hash();
-				tx_in_block.wait_for_success().await?;
-				return Ok(block_hash);
-			},
-			TxStatus::Error { message } |
-			TxStatus::Invalid { message } |
-			TxStatus::Dropped { message } => {
-				return Err(anyhow!("Error submitting signed tx: {message}"));
-			},
-			_ => continue,
-		}
-	}
-
-	Err(anyhow!("Transaction event stream ended without being included in a block"))
+	tx_in_block.wait_for_success().await?;
+	Ok(tx_in_block.block_hash())
 }

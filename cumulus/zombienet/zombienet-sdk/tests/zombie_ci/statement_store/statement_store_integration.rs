@@ -6,7 +6,8 @@ use log::info;
 use sp_core::{sr25519, Bytes, Pair};
 use sp_statement_store::{Channel, RejectionReason, StatementAllowance, SubmitResult, Topic};
 use verifiable::{ring_vrf_impl::BandersnatchVrfVerifiable as Crypto, GenerateVerifiable};
-use zombienet_sdk::subxt::{dynamic::Value, ext::subxt_rpcs::rpc_params, tx::signer::Signer};
+use subxt::{dynamic::Value, transactions::Signer};
+use zombienet_sdk::subxt::ext::subxt_rpcs::rpc_params;
 
 use super::{
 	common::{
@@ -14,10 +15,14 @@ use super::{
 		expect_statements_unordered, get_keypair, submit_statement, subscribe_all, subscribe_topic,
 		subscribe_topic_match_any,
 	},
-	lite_person_setup::{create_attest_call, create_increase_allowance_call, MSG_PREFIX},
+	lite_person_setup::{
+		create_attest_call, create_consumer_registration_params, create_increase_allowance_call,
+		MSG_PREFIX,
+	},
 	sudo_helpers::{
-		create_allowance_items, create_uniform_allowance_items, spawn_network, spawn_network_sudo,
-		submit_signed_extrinsic, submit_sudo_extrinsic, CustomConfig,
+		create_allowance_items, create_uniform_allowance_items, online_client_from_node,
+		spawn_network, spawn_network_sudo, submit_signed_extrinsic, submit_sudo_extrinsic,
+		CustomConfig,
 	},
 };
 
@@ -531,20 +536,18 @@ async fn statement_store_lite_person_submit_and_propagate() -> Result<(), anyhow
 
 	let alice_node = network.get_node("alice")?;
 	let bob_node = network.get_node("bob")?;
-	let para_client = alice_node.wait_client::<CustomConfig>().await?;
+	let para_client = online_client_from_node(alice_node).await?;
 
-	let alice = zombienet_sdk::subxt_signer::sr25519::dev::alice();
+	let alice = subxt_signer::sr25519::dev::alice();
 	let alice_account_id =
-		<zombienet_sdk::subxt_signer::sr25519::Keypair as Signer<CustomConfig>>::account_id(
-			&alice,
-		);
+		<subxt_signer::sr25519::Keypair as Signer<CustomConfig>>::account_id(&alice);
 
 	// Alice one attestation allowance via sudo
 	info!("Granting attestation allowance to Alice...");
 	let increase_call = create_increase_allowance_call(alice_account_id.0.to_vec(), 1);
-	let mut nonce = para_client.tx().account_nonce(&alice_account_id).await?;
+	let mut nonce = para_client.tx().await?.account_nonce(&alice_account_id).await?;
 	info!("Alice nonce before increase_allowance: {nonce}");
-	let _tx_stream =
+	let _block_hash =
 		submit_sudo_extrinsic(&para_client, &increase_call, &alice, nonce).await?;
 	nonce += 1;
 	info!("Attestation allowance granted");
@@ -565,28 +568,35 @@ async fn statement_store_lite_person_submit_and_propagate() -> Result<(), anyhow
 	let proof_of_ownership =
 		Crypto::sign(&ring_secret, &msg).expect("ring VRF signing should succeed");
 
+	let consumer_registration = create_consumer_registration_params(
+		&candidate_pair,
+		&candidate_account,
+		&alice_account_id.0,
+	);
+
 	info!("Submitting PeopleLite::attest call with nonce {nonce}...");
 	let attest_call = create_attest_call(
 		candidate_account.to_vec(),
 		candidate_sig.0.to_vec(),
 		ring_member.0.to_vec(),
 		proof_of_ownership.to_vec(),
+		Some(consumer_registration),
 	);
 	let block_hash =
 		submit_signed_extrinsic(&para_client, &attest_call, &alice, nonce).await?;
-	info!("Attest call succeeded — lite person registered (block {block_hash:?})");
+	info!("Attest call succeeded — lite person registered with consumer allowance (block {block_hash:?})");
 
 	// verify the candidate appears in LitePeople storage
-	let lite_people_query = zombienet_sdk::subxt::dynamic::storage("PeopleLite", "LitePeople", vec![
-		Value::from_bytes(candidate_account.to_vec()),
-	]);
-	let entry = para_client.storage().at(block_hash).fetch(&lite_people_query).await?;
+	let lite_people_query =
+		subxt::dynamic::storage::<([u8; 32],), Value>("PeopleLite", "LitePeople");
+	let at_block = para_client.at_block(block_hash).await?;
+	let entry = at_block.storage().try_fetch(lite_people_query, (candidate_account,)).await?;
 	assert!(entry.is_some(), "Candidate should be registered in LitePeople storage");
 	info!("Verified: candidate is present in LitePeople storage");
 
 	// reach the attest block before submitting statements
-	let attest_block_number =
-		para_client.blocks().at(block_hash).await?.number() as f64;
+	let at_block = para_client.at_block(block_hash).await?;
+	let attest_block_number = at_block.block_number() as f64;
 	info!("Waiting for attest block ({attest_block_number}) to finalize...");
 	alice_node
 		.wait_metric_with_timeout(

@@ -11,23 +11,26 @@
 use codec::Encode;
 use log::info;
 use sp_core::{sr25519, Pair};
-use verifiable::{ring_vrf_impl::BandersnatchVrfVerifiable as Crypto, GenerateVerifiable};
-use zombienet_sdk::subxt::{
+use subxt::{
 	dynamic::Value,
 	ext::scale_value::value,
-	tx::{signer::Signer, DynamicPayload},
+	transactions::{DynamicPayload, Signer},
 };
+use verifiable::{ring_vrf_impl::BandersnatchVrfVerifiable as Crypto, GenerateVerifiable};
 
 use super::sudo_helpers::{
-	spawn_network, submit_signed_extrinsic, submit_sudo_extrinsic, CustomConfig,
+	online_client_from_node, spawn_network, submit_signed_extrinsic, submit_sudo_extrinsic,
+	CustomConfig,
 };
 
 /// Matches `indiv_pallet_people_lite::MSG_PREFIX`
 pub(super) const MSG_PREFIX: &[u8; 30] = b"pop:people-lite:register using";
 
-/// Creates a `Sudo::sudo(PeopleLite::increase_attestation_allowance { account, count })` call
-pub(super) fn create_increase_allowance_call(account_bytes: Vec<u8>, count: u32) -> DynamicPayload {
-	zombienet_sdk::subxt::tx::dynamic(
+pub(super) fn create_increase_allowance_call(
+	account_bytes: Vec<u8>,
+	count: u32,
+) -> DynamicPayload<Vec<Value>> {
+	subxt::transactions::dynamic(
 		"Sudo",
 		"sudo",
 		vec![value! {
@@ -39,14 +42,18 @@ pub(super) fn create_increase_allowance_call(account_bytes: Vec<u8>, count: u32)
 	)
 }
 
-/// Creates a `PeopleLite::attest` call with `consumer_registration: None`
 pub(super) fn create_attest_call(
 	candidate_bytes: Vec<u8>,
 	sr25519_signature_bytes: Vec<u8>,
 	ring_vrf_key_inner: Vec<u8>,
 	proof_of_ownership_bytes: Vec<u8>,
-) -> DynamicPayload {
-	zombienet_sdk::subxt::tx::dynamic(
+	consumer_registration: Option<Value>,
+) -> DynamicPayload<Vec<Value>> {
+	let consumer_reg_value = consumer_registration
+		.map(|v| Value::unnamed_variant("Some", vec![v]))
+		.unwrap_or_else(|| Value::unnamed_variant("None", vec![]));
+
+	subxt::transactions::dynamic(
 		"PeopleLite",
 		"attest",
 		vec![
@@ -58,9 +65,55 @@ pub(super) fn create_attest_call(
 			Value::unnamed_composite(vec![Value::from_bytes(ring_vrf_key_inner)]),
 			// Plain VRF signature is [u8; 96]
 			Value::from_bytes(proof_of_ownership_bytes),
-			Value::unnamed_variant("None", vec![]),
+			consumer_reg_value,
 		],
 	)
+}
+
+/// Constructs a `LiteConsumerRegistrationParams` dynamic Value for the `attest` call
+///
+/// The signing payload is `encode(account, verifier, identifier_key, username_prefix,
+/// reserved_username)` where `username_prefix` is the part of the username before the `.`
+/// separator
+pub(super) fn create_consumer_registration_params(
+	candidate_pair: &sr25519::Pair,
+	candidate_account: &[u8; 32],
+	verifier_account: &[u8; 32],
+) -> Value {
+	// Use a dummy 65-byte identifier key
+	let identifier_key: [u8; 65] = [0u8; 65];
+	// Lite usernames must follow the pattern: <lowercase letters>.<digits>
+	// with at least MinUsernameLength letters and at least 3 digits
+	let username: Vec<u8> = b"testuser.123".to_vec();
+
+	// Build the signing payload: encode(account, verifier, identifier_key,
+	// username[..separator_idx], reserved_username)
+	// signing payload uses only the prefix before the `.` separator
+	let separator_idx = username.iter().position(|b| *b == b'.').unwrap_or(username.len());
+	let reserved_username: Option<Vec<u8>> = None;
+	let payload = (
+		candidate_account,
+		verifier_account,
+		&identifier_key,
+		&username[..separator_idx],
+		&reserved_username,
+	)
+		.encode();
+
+	let sig = candidate_pair.sign(&payload);
+
+	Value::unnamed_composite(vec![
+		// signature: MultiSignature::Sr25519
+		Value::unnamed_variant("Sr25519", vec![Value::from_bytes(sig.0.to_vec())]),
+		// account: AccountId32
+		Value::from_bytes(candidate_account.to_vec()),
+		// identifier_key: [u8; 65]
+		Value::from_bytes(identifier_key.to_vec()),
+		// username: BoundedVec<u8, 32>
+		Value::from_bytes(username),
+		// reserved_username: Option<Username>
+		Value::unnamed_variant("None", vec![]),
+	])
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -71,19 +124,17 @@ async fn lite_person_setup_via_extrinsics() -> Result<(), anyhow::Error> {
 
 	let network = spawn_network(&["alice"]).await?;
 	let node = network.get_node("alice")?;
-	let para_client = node.wait_client::<CustomConfig>().await?;
+	let para_client = online_client_from_node(node).await?;
 
-	let alice = zombienet_sdk::subxt_signer::sr25519::dev::alice();
+	let alice = subxt_signer::sr25519::dev::alice();
 	let alice_account_id =
-		<zombienet_sdk::subxt_signer::sr25519::Keypair as Signer<CustomConfig>>::account_id(
-			&alice,
-		);
+		<subxt_signer::sr25519::Keypair as Signer<CustomConfig>>::account_id(&alice);
 
 	info!("Granting attestation allowance to Alice...");
 	let increase_call = create_increase_allowance_call(alice_account_id.0.to_vec(), 1);
-	let mut nonce = para_client.tx().account_nonce(&alice_account_id).await?;
+	let mut nonce = para_client.tx().await?.account_nonce(&alice_account_id).await?;
 	info!("Alice nonce before increase_allowance: {nonce}");
-	let _tx_stream =
+	let _block_hash =
 		submit_sudo_extrinsic(&para_client, &increase_call, &alice, nonce).await?;
 	nonce += 1;
 	info!("Attestation allowance granted");
@@ -112,16 +163,17 @@ async fn lite_person_setup_via_extrinsics() -> Result<(), anyhow::Error> {
 		candidate_sig.0.to_vec(),
 		ring_member.0.to_vec(),
 		proof_of_ownership.to_vec(),
+		None,
 	);
 	let block_hash =
 		submit_signed_extrinsic(&para_client, &attest_call, &alice, nonce).await?;
 	info!("Attest call succeeded — lite person registered (block {block_hash:?})");
 
 	// verify the candidate appears in LitePeople storage
-	let lite_people_query = zombienet_sdk::subxt::dynamic::storage("PeopleLite", "LitePeople", vec![
-		Value::from_bytes(candidate_account.to_vec()),
-	]);
-	let entry = para_client.storage().at(block_hash).fetch(&lite_people_query).await?;
+	let lite_people_query =
+		subxt::dynamic::storage::<([u8; 32],), Value>("PeopleLite", "LitePeople");
+	let at_block = para_client.at_block(block_hash).await?;
+	let entry = at_block.storage().try_fetch(lite_people_query, (candidate_account,)).await?;
 	assert!(entry.is_some(), "Candidate should be registered in LitePeople storage");
 	info!("Verified: candidate is present in LitePeople storage");
 
