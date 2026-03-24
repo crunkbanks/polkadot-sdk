@@ -76,8 +76,12 @@
 //!
 //! ## RPC Methods
 //!
-//! - `hop_submit(data: Bytes, recipients: Vec<Bytes>, proof: Bytes) -> SubmitResult` - Submit data with SCALE-encoded MultiSigner recipient keys and personhood proof, returns hash + pool status
-//! - `hop_claim(hash: Bytes, signature: Bytes) -> Bytes` - Claim data with SCALE-encoded MultiSignature
+//! - `hop_submit(data: Bytes, recipients: Vec<Bytes>, proof: Bytes) -> SubmitResult` - Submit data
+//!   with SCALE-encoded MultiSigner recipient keys and personhood proof, returns hash + pool status
+//! - `hop_claim(hash: Bytes, signature: Bytes) -> Bytes` - Download data (read-only, no state
+//!   mutation). Must be followed by `hop_ack` to confirm receipt.
+//! - `hop_ack(hash: Bytes, signature: Bytes) -> ()` - Acknowledge receipt. Marks recipient as
+//!   claimed, triggers cleanup when all recipients have ack'd. Idempotent.
 //! - `hop_poolStatus() -> PoolStatus` - Get pool statistics
 //!
 //! ## CLI Flags
@@ -85,7 +89,7 @@
 //! - `--enable-hop` - Enable HOP service
 //! - `--hop-max-pool-size <MiB>` - Maximum pool size (default: 10240 MiB)
 //! - `--hop-retention-blocks <blocks>` - Retention period (default: 14400)
-//! - `--hop-check-interval <seconds>` - Promotion check interval (default: 60)
+//! - `--hop-check-interval <seconds>` - Expiry cleanup interval (default: 60)
 
 pub mod cli;
 pub mod pool;
@@ -98,4 +102,4 @@ pub use cli::HopParams;
 pub use pool::HopDataPool;
 pub use primitives::{HopBlockNumber, HopHash};
 pub use rpc::{HopApiServer, HopRpcServer, NoopVerifier, PersonhoodVerifier};
-pub use types::{Alias, HopEntryMeta, HopError, HopPoolEntry, PoolStatus, SubmitResult};
+pub use types::{Alias, HopEntryMeta, HopError, PoolStatus, SubmitResult};
