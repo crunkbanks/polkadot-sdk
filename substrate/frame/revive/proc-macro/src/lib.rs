@@ -435,7 +435,12 @@ fn expand_functions(def: &EnvDef) -> TokenStream2 {
 				});
 
 				// wrap body in closure to make sure the tracing is always executed
-				let result = (|| #body)();
+				let result = (|| {
+					// Charge base syscall overhead inside the trace window so it is
+					// attributed to this syscall step in execution traces.
+					self.charge_gas(crate::vm::RuntimeCosts::HostFn).map_err(TrapReason::from)?;
+					#body
+				})();
 				::log::trace!(target: "runtime::revive::strace", #trace_fmt_str, #( #trace_fmt_args, )* result, self.ext.frame_meter().weight_consumed());
 
 				crate::tracing::if_tracing(|tracer| tracer.exit_step(self, #trace_return));
@@ -468,9 +473,6 @@ fn expand_functions(def: &EnvDef) -> TokenStream2 {
 		crate::tracing::if_tracing(|tracer| tracer.exit_step(self, None));
 
 		__sync_result__?;
-
-		// This is the overhead to call an empty syscall that always needs to be charged.
-		self.charge_gas(crate::vm::RuntimeCosts::HostFn).map_err(TrapReason::from)?;
 
 		// They will be mapped to variable names by the syscall specific code.
 		let (__a0__, __a1__, __a2__, __a3__, __a4__, __a5__) = memory.read_input_regs();
