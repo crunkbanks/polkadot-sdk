@@ -16,7 +16,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use console::style;
+
 use log::info;
 use sc_client_api::ClientInfo;
 use sc_network::NetworkStatus;
@@ -136,15 +136,15 @@ impl<B: BlockT> InformantDisplay<B> {
 			target: "substrate",
 			"{} {}{} ({} peers), best: #{} ({}), finalized #{} ({}), ⬇ {} ⬆ {}",
 			level,
-			style(&status).white().bold(),
+			&status,
 			target,
-			style(num_connected_peers).white().bold(),
-			style(best_number).white().bold(),
+			num_connected_peers,
+			best_number,
 			PrintFullHashOnDebugLogging(&best_hash),
-			style(finalized_number).white().bold(),
+			finalized_number,
 			PrintFullHashOnDebugLogging(&info.chain.finalized_hash),
-			style(TransferRateFormat(avg_bytes_per_sec_inbound)).green(),
-			style(TransferRateFormat(avg_bytes_per_sec_outbound)).red(),
+			TransferRateFormat(avg_bytes_per_sec_inbound),
+			TransferRateFormat(avg_bytes_per_sec_outbound),
 		)
 	}
 }
